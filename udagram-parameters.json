@@ -9,6 +9,6 @@
     },
     {
         "ParameterKey": "KeyName",
-        "ParameterValue": "your-key-name"  # Replace with your SSH key name
+        "ParameterValue": "udagram-key"
     }
 ] 
