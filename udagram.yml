@@ -1,0 +1,254 @@
+Description: CD12352 - Infrastructure as Code Project - Udagram Application
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: UdagramProject
+
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+
+  AMI:
+    Description: AMI ID for Ubuntu 22.04
+    Type: String
+    Default: ami-0261755bbcb8c4a84  # Ubuntu 22.04 LTS in us-east-1
+
+  KeyName:
+    Description: SSH Key Name
+    Type: String
+
+Resources:
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http traffic to load balancer
+      VpcId: 
+        Fn::ImportValue: !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http from load balancer and SSH from bastion
+      VpcId: 
+        Fn::ImportValue: !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref LBSecGroup
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        FromPort: -1
+        ToPort: -1
+        CidrIp: 0.0.0.0/0
+
+  WebAppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AMI
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds: 
+          - !Ref WebServerSecGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Install Apache and start it
+            apt-get update -y
+            apt-get install apache2 -y
+            systemctl start apache2.service
+            systemctl enable apache2.service
+            
+            # Create a custom index page
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Udacity Demo Web Server</title>
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        margin: 40px;
+                        text-align: center;
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>Udacity Demo Web Server Up and Running!</h1>
+                <p>Deployed via CloudFormation</p>
+                <p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                <p>Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>
+            </body>
+            </html>
+            EOF
+
+            # Ensure Apache is running
+            systemctl status apache2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName} Web Server
+        MetadataOptions:
+          HttpTokens: required  # IMDSv2 requirement
+          HttpEndpoint: enabled
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue: !Sub "${EnvironmentName}-VPCID"
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Target Group
+
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PRIV1-SN"
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PRIV2-SN"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebAppLaunchTemplate
+        Version: !GetAtt WebAppLaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      TargetGroupARNs:
+        - !Ref WebAppTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} ASG
+          PropagateAtLaunch: true
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+            - "GroupDesiredCapacity"
+            - "GroupInServiceInstances"
+            - "GroupTotalInstances"
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+        - !Ref LBSecGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Load Balancer
+      Type: application
+      Scheme: internet-facing
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      LoadBalancerArn: !Ref WebAppLB
+      Port: 80
+      Protocol: HTTP
+
+  WebAppS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  WebAppS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebAppS3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref WebAppS3Bucket, '/*']]
+
+  WebAppScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebAppGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+  WebAppScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebAppGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale up if CPU > 90% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      AlarmActions: [!Ref WebAppScaleUpPolicy]
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebAppGroup
+      ComparisonOperator: GreaterThanThreshold
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale down if CPU < 30% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30
+      AlarmActions: [!Ref WebAppScaleDownPolicy]
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebAppGroup
+      ComparisonOperator: LessThanThreshold
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: DNS name of the load balancer
+    Value: !Join ['', ['http://', !GetAtt WebAppLB.DNSName]]
+    Export:
+      Name: !Sub ${EnvironmentName}-LB-URL
